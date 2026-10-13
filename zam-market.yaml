@@ -1,0 +1,114 @@
+
+On all nodes:
+=============
+# Hostnames (run the matching one on each node)
+sudo hostnamectl set-hostname k8s-master   # k8s-worker1 / k8s-worker2
+
+# Disable swap
+sudo swapoff -a
+sudo sed -i '/ swap / s/^/#/' /etc/fstab
+
+# Kernel modules and sysctl
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+sudo modprobe overlay && sudo modprobe br_netfilter
+
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sudo sysctl --system
+
+# containerd
+sudo apt-get update
+sudo apt-get install -y containerd apt-transport-https ca-certificates curl gpg
+sudo mkdir -p /etc/containerd
+containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo systemctl restart containerd && sudo systemctl enable containerd
+
+# kubeadm, kubelet, kubectl
+K8S_MINOR=v1.36
+sudo mkdir -p -m 755 /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" \
+  | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+sudo systemctl enable --now kubelet
+
+
+
+---
+
+On Master:
+
+MASTER_IP=$(hostname -I | awk '{print $1}')   # private IP
+sudo kubeadm init \
+  --apiserver-advertise-address=$MASTER_IP \
+  --pod-network-cidr=10.244.0.0/16
+
+# kubectl access for your user
+mkdir -p $HOME/.kube
+sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# Pod network (Flannel's default CIDR matches the one above)
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+---
+
+join command for workers:
+=========================
+sudo kubeadm join 172.31.39.211:6443 --token 11rxmc.m14z6uvm0h07aiou \
+  --discovery-token-ca-cert-hash sha256:e0c7c8b62522d5c3d17d58d47410cf970ee9530a251d3d84b00ae21298d669bc
+
+---
+
+Checks:
+
+# 1. Label the workers (only changes what the ROLES column shows)
+kubectl label node node2 node-role.kubernetes.io/worker=
+kubectl label node node7 node-role.kubernetes.io/worker=
+
+# 2. Check the system pods: coredns and kube-flannel should all be Running
+kubectl get pods -A
+
+# 3. Smoke test: pods spread across the workers, reachable via NodePort
+kubectl create deploy nginx --image=nginx --replicas=2
+kubectl expose deploy nginx --port=80 --type=NodePort
+kubectl get pods -o wide        # should land on node2 and node7
+kubectl get svc nginx           # note the 3xxxx port
+curl http://<node2-private-ip>:<nodeport>   # should return the nginx welcome page
+
+# 4. Check DNS works between pods
+kubectl run dnstest --image=busybox:1.36 --rm -it --restart=Never -- nslookup kubernetes.default
+
+---
+
+kubectl get pods -o wide
+# Should show both pods Running, each with a 10.244.x.x IP
+
+curl -s http://$(kubectl get node node2 -o jsonpath='{.status.addresses[0].address}'):31120 | head -5
+# Should show the start of the nginx welcome page HTML
+
+kubectl run dnstest --image=busybox:1.36 --rm -it --restart=Never -- nslookup kubernetes.default.svc.cluster.local
+# Should print Address: 10.96.0.1
+
+scp -i k8skey.pem zam-market.yaml ubuntu@54.164.75.237:~/
+
+kubectl apply -f zam-market.yaml
+kubectl -n zam-market get pods -o wide
+kubectl -n zam-market get svc
+
+---
+http://<public-ip-of-any-node>:30080.
+
+kubectl -n zam-market scale deploy zam-market --replicas=4   # scale out
+kubectl -n zam-market rollout restart deploy zam-market      # redeploy after editing the ConfigMap
+kubectl delete -f zam-market.yaml                            # remove everything
