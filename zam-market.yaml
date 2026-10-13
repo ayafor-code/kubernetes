@@ -1,114 +1,122 @@
-
-On all nodes:
-=============
-# Hostnames (run the matching one on each node)
-sudo hostnamectl set-hostname k8s-master   # k8s-worker1 / k8s-worker2
-
-# Disable swap
-sudo swapoff -a
-sudo sed -i '/ swap / s/^/#/' /etc/fstab
-
-# Kernel modules and sysctl
-cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
-overlay
-br_netfilter
-EOF
-sudo modprobe overlay && sudo modprobe br_netfilter
-
-cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
-net.bridge.bridge-nf-call-iptables  = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward                 = 1
-EOF
-sudo sysctl --system
-
-# containerd
-sudo apt-get update
-sudo apt-get install -y containerd apt-transport-https ca-certificates curl gpg
-sudo mkdir -p /etc/containerd
-containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
-sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-sudo systemctl restart containerd && sudo systemctl enable containerd
-
-# kubeadm, kubelet, kubectl
-K8S_MINOR=v1.36
-sudo mkdir -p -m 755 /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" \
-  | sudo tee /etc/apt/sources.list.d/kubernetes.list
-sudo apt-get update
-sudo apt-get install -y kubelet kubeadm kubectl
-sudo apt-mark hold kubelet kubeadm kubectl
-sudo systemctl enable --now kubelet
-
-
-
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zam-market
 ---
-
-On Master:
-
-MASTER_IP=$(hostname -I | awk '{print $1}')   # private IP
-sudo kubeadm init \
-  --apiserver-advertise-address=$MASTER_IP \
-  --pod-network-cidr=10.244.0.0/16
-
-# kubectl access for your user
-mkdir -p $HOME/.kube
-sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
-
-# Pod network (Flannel's default CIDR matches the one above)
-kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
-
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zam-market-html
+  namespace: zam-market
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Zam Market</title>
+      <style>
+        body { margin:0; font-family: Arial, sans-serif; background:#f4f6f8; color:#222; }
+        header { background:#1b7f3b; color:#fff; padding:24px; text-align:center; }
+        header h1 { margin:0; font-size:2.2em; }
+        .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; padding:24px; max-width:1000px; margin:auto; }
+        .card { background:#fff; border-radius:8px; padding:20px; box-shadow:0 2px 6px rgba(0,0,0,.08); text-align:center; }
+        .price { color:#1b7f3b; font-weight:bold; font-size:1.2em; }
+        footer { text-align:center; padding:16px; color:#666; font-size:.9em; }
+      </style>
+    </head>
+    <body>
+      <header>
+        <h1>Zam Market</h1>
+        <p>Fresh produce, delivered</p>
+      </header>
+      <div class="grid">
+        <div class="card"><h3>Plantains</h3><p class="price">1,500 FCFA</p></div>
+        <div class="card"><h3>Tomatoes (1 kg)</h3><p class="price">800 FCFA</p></div>
+        <div class="card"><h3>Avocados</h3><p class="price">500 FCFA</p></div>
+        <div class="card"><h3>Pineapple</h3><p class="price">700 FCFA</p></div>
+      </div>
+      <footer>Served by pod: <b>POD_NAME</b></footer>
+    </body>
+    </html>
 ---
-
-join command for workers:
-=========================
-sudo kubeadm join 172.31.39.211:6443 --token 11rxmc.m14z6uvm0h07aiou \
-  --discovery-token-ca-cert-hash sha256:e0c7c8b62522d5c3d17d58d47410cf970ee9530a251d3d84b00ae21298d669bc
-
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zam-market
+  namespace: zam-market
+  labels:
+    app: zam-market
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: zam-market
+  template:
+    metadata:
+      labels:
+        app: zam-market
+    spec:
+      initContainers:
+        # Copies the page and stamps in the pod name, so you can see load balancing
+        - name: render-page
+          image: busybox:1.36
+          command: ["sh", "-c", "sed \"s/POD_NAME/$POD_NAME/\" /src/index.html > /html/index.html"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: src
+              mountPath: /src
+            - name: html
+              mountPath: /html
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: src
+          configMap:
+            name: zam-market-html
+        - name: html
+          emptyDir: {}
 ---
-
-Checks:
-
-# 1. Label the workers (only changes what the ROLES column shows)
-kubectl label node node2 node-role.kubernetes.io/worker=
-kubectl label node node7 node-role.kubernetes.io/worker=
-
-# 2. Check the system pods: coredns and kube-flannel should all be Running
-kubectl get pods -A
-
-# 3. Smoke test: pods spread across the workers, reachable via NodePort
-kubectl create deploy nginx --image=nginx --replicas=2
-kubectl expose deploy nginx --port=80 --type=NodePort
-kubectl get pods -o wide        # should land on node2 and node7
-kubectl get svc nginx           # note the 3xxxx port
-curl http://<node2-private-ip>:<nodeport>   # should return the nginx welcome page
-
-# 4. Check DNS works between pods
-kubectl run dnstest --image=busybox:1.36 --rm -it --restart=Never -- nslookup kubernetes.default
-
----
-
-kubectl get pods -o wide
-# Should show both pods Running, each with a 10.244.x.x IP
-
-curl -s http://$(kubectl get node node2 -o jsonpath='{.status.addresses[0].address}'):31120 | head -5
-# Should show the start of the nginx welcome page HTML
-
-kubectl run dnstest --image=busybox:1.36 --rm -it --restart=Never -- nslookup kubernetes.default.svc.cluster.local
-# Should print Address: 10.96.0.1
-
-scp -i k8skey.pem zam-market.yaml ubuntu@54.164.75.237:~/
-
-kubectl apply -f zam-market.yaml
-kubectl -n zam-market get pods -o wide
-kubectl -n zam-market get svc
-
----
-http://<public-ip-of-any-node>:30080.
-
-kubectl -n zam-market scale deploy zam-market --replicas=4   # scale out
-kubectl -n zam-market rollout restart deploy zam-market      # redeploy after editing the ConfigMap
-kubectl delete -f zam-market.yaml                            # remove everything
+apiVersion: v1
+kind: Service
+metadata:
+  name: zam-market
+  namespace: zam-market
+spec:
+  type: NodePort
+  selector:
+    app: zam-market
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30080
